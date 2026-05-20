@@ -113,7 +113,10 @@
     %% keepalive request_begin is refcounted; each loop round re-emits
     %% {pipeline, loaded}, so only the first round begins (one matching
     %% request_end runs in cleanup).
-    keepalive_begun = false :: boolean()
+    keepalive_begun = false :: boolean(),
+    %% response.created is a once-per-turn event; loop rounds re-enter
+    %% the admit path, so this guards against re-emitting it.
+    created_sent = false :: boolean()
 }).
 
 %%====================================================================
@@ -697,11 +700,13 @@ continue_after_tool(Result, Req, S0) ->
                                 <<"[tool_result id=", CallId/binary, "]: ", ResultJson/binary>>
                         }
                     ],
+            %% Continue on the warm sticky-seq path (session_id kept),
+            %% the same mechanism as a previous_response_id follow-up.
+            %% Clearing it would force a cold admit each round, which is
+            %% exactly what wedges the engine; pinning the session lets
+            %% the pipeline prefill only the appended tool result.
             ContReq = (S1#st.loop_request)#erllama_request{
-                messages = NewMessages,
-                %% Full re-inference: clear the session so the pipeline
-                %% does a cold infer/4 rather than a sticky-seq continue.
-                session_id = undefined
+                messages = NewMessages
             },
             %% Release this round's queue slot before the next worker
             %% acquires its own, or a concurrency=1 queue deadlocks.
@@ -1034,6 +1039,11 @@ finish_err(Req0, S = #st{stream = false}, Reason) ->
 %% Stream block helpers
 %%====================================================================
 
+%% response.created is emitted once per turn. A loop round re-enters
+%% learn_ref / admitted with a fresh ref, so guard against re-emitting
+%% it (later rounds still open their own message item).
+emit_response_created(_Req, S = #st{created_sent = true}) ->
+    S;
 emit_response_created(Req, S) ->
     Payload = erllama_server_translate:internal_to_responses_partial(
         S#st.response_id, S#st.requested
@@ -1042,7 +1052,7 @@ emit_response_created(Req, S) ->
         <<"response.created">>, Payload
     ),
     cowboy_req:stream_body(Frame, nofin, Req),
-    S.
+    S#st{created_sent = true}.
 
 emit_message_added(Req, S) ->
     Payload = erllama_server_translate:internal_to_responses_message_added(
@@ -1311,9 +1321,14 @@ is_tool_first_byte(<<${, _/binary>>) -> true;
 is_tool_first_byte(_) -> false.
 
 parse_tool_call_legacy(JsonBin) ->
-    case json:decode(JsonBin) of
+    %% The buffered JSON can be truncated when the model hits
+    %% max_output_tokens mid tool-call; tolerate a decode failure
+    %% rather than crashing the handler.
+    try json:decode(JsonBin) of
         #{<<"name">> := Name, <<"arguments">> := Args} ->
             {Name, json:encode(Args)};
         _ ->
             {<<"unknown">>, JsonBin}
+    catch
+        _:_ -> {<<"unknown">>, JsonBin}
     end.
