@@ -110,31 +110,114 @@ provider (missing `api_key`, unreachable `endpoint`) folds an error
 result into the conversation so the model can recover rather than
 failing the turn; the server logs the failure.
 
-## Add your own executor
+## Write your own executor
 
-A new server-side tool is one module plus one registry line. The
-module implements the `erllama_server_tool_executor` behaviour:
+A server-side tool is **one module plus one registry line**. The
+module implements the `erllama_server_tool_executor` behaviour: two
+callbacks, both surface-agnostic. You never touch the handlers, the
+grammar, or the loop.
+
+### The behaviour
 
 ```erlang
--module(my_tool_executor).
--behaviour(erllama_server_tool_executor).
--export([declare/0, execute/2]).
+%% Static declaration: the model-facing tool. Called at request-parse
+%% time, so it takes no arguments and must be pure.
+-callback declare() -> tool().
 
-%% Model-facing name + JSON-Schema for the arguments.
+%% Run the tool. Called once per tool round, in a separate process so
+%% it can block on I/O without stalling the request.
+-callback execute(Args :: map(), Ctx :: map()) ->
+    {ok, ResultJson :: map()} | {error, term()}.
+```
+
+`tool()` is `#{name := binary(), description := binary(), schema :=
+map()}` where `schema` is a JSON-Schema object for the arguments.
+
+### declare/0
+
+Returns the tool the model sees. The `name` becomes both the GBNF
+grammar tool name and the key under which the executor is recorded, so
+it must match the tool the model is expected to call. `schema`
+constrains the arguments the model may produce.
+
+```erlang
 declare() ->
     #{name => <<"my_tool">>,
-      description => <<"...">>,
+      description => <<"One line the model uses to decide when to call it.">>,
       schema => #{<<"type">> => <<"object">>,
                   <<"properties">> => #{<<"x">> => #{<<"type">> => <<"string">>}},
                   <<"required">> => [<<"x">>]}}.
-
-%% Run it. Args is the parsed arguments map; Ctx carries model,
-%% request_id, session_id, and config (the registry entry's extra
-%% keys). Return a JSON-encodable map, or {error, Reason}.
-execute(#{<<"x">> := X}, _Ctx) ->
-    {ok, #{<<"result">> => X}}.
 ```
 
-Then register it: `<<"my_tool">> => #{module => my_tool_executor,
-type => <<"my_tool">>}`. The grammar offers it, the loop runs it, and
-it works on every API surface.
+### execute/2
+
+`Args` is the parsed `arguments` object the model produced (already
+constrained by `schema` via the grammar). `Ctx` is request-scoped,
+read-only:
+
+| key          | value                                                       |
+|--------------|-------------------------------------------------------------|
+| `model`      | resolved model id (binary)                                  |
+| `request_id` | for log correlation (binary)                                |
+| `session_id` | sticky-seq session (binary \| undefined)                    |
+| `config`     | the registry entry minus `module`/`type` (your backend cfg) |
+
+`config` is how an executor reads its own settings (api keys,
+endpoints, limits): they come from the registry entry, never from
+global app env. Return:
+
+- `{ok, Map}` — `Map` must be JSON-encodable; it is folded into the
+  conversation as the tool result and the model continues. Keep it
+  compact and model-friendly (the model reads it as text).
+- `{error, Reason}` — folded as an error result so the model can
+  recover; it does **not** abort the turn. An executor crash or
+  timeout is treated the same way.
+
+```erlang
+execute(#{<<"x">> := X}, #{config := Cfg}) ->
+    Key = maps:get(api_key, Cfg, undefined),
+    case do_work(X, Key) of
+        {ok, Result} -> {ok, #{<<"result">> => Result}};
+        {error, R}   -> {error, R}
+    end.
+```
+
+### Things the framework handles for you
+
+- **Concurrency**: `execute/2` runs in a monitored child process, so
+  blocking on HTTP is fine. It is bounded by a timeout
+  (`generation_idle_ms`); on timeout the round folds an error result.
+- **The loop**: detecting the call, feeding the result back, the warm
+  re-inference, the iteration cap (`max_tool_iterations`), and
+  cancel-on-disconnect are all done for you.
+- **Cross-surface**: the same executor runs on `/v1/responses`,
+  `/v1/chat/completions`, and `/v1/messages`.
+
+What you should NOT do: call back into the handler, hold long-lived
+state across calls (each `execute/2` is independent), or assume the
+model will call you exactly once (it may call across several rounds up
+to the cap).
+
+### Register it
+
+In `config/sys.config`, keyed by the OpenAI/Anthropic tool `type` the
+request carries (often the same string as the tool name):
+
+```erlang
+{builtin_tool_executors, #{
+  <<"my_tool">> => #{module => my_tool_executor,
+                     type => <<"my_tool">>,
+                     %% any extra keys are passed through as Ctx.config
+                     api_key => <<"...">>}
+}}
+```
+
+Built-ins ship disabled (the default registry is empty); registering
+an entry is what enables a tool. Anthropic sends versioned built-in
+types (`web_search_20250305`); the server normalises the trailing
+`_YYYYMMDD` to the canonical key before lookup, so register under the
+canonical `type` (`web_search`).
+
+`web_search` (`erllama_server_tool_executor_web_search`) is the
+reference implementation if you want a worked example with a real
+backend.
